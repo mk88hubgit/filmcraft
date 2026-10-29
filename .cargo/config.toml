@@ -1,2 +1,1022 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+diff -ruN orig/filmcraft-main/crates/codecs/src/video.rs filmcraft-main/crates/codecs/src/video.rs
+--- orig/filmcraft-main/crates/codecs/src/video.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/codecs/src/video.rs	2026-10-25 23:55:49.630349965 +0000
+@@ -417,15 +417,16 @@
+                 Plane::U8(v) => v.into_iter().map(u16::from).collect(),
+             }
+         };
++        let chroma = if p.chroma_format_idc == 2 { filmcraft_frame::Chroma::C422 } else { filmcraft_frame::Chroma::C420 };
+         let data = match (p.y, p.u, p.v) {
+             (Plane::U8(y), Plane::U8(u), Plane::U8(v)) => filmcraft_frame::PixelData::Yuv8 {
+                 planes: [Arc::new(tight_plane(y, ys, w, h)), Arc::new(tight_plane(u, uvs, cw, ch)), Arc::new(tight_plane(v, uvs, cw, ch))],
+-                chroma: filmcraft_frame::Chroma::C420,
++                chroma,
+                 alpha: None,
+             },
+             (y, u, v) => filmcraft_frame::PixelData::Yuv16 {
+                 planes: [Arc::new(tight_plane(wide(y), ys, w, h)), Arc::new(tight_plane(wide(u), uvs, cw, ch)), Arc::new(tight_plane(wide(v), uvs, cw, ch))],
+-                chroma: filmcraft_frame::Chroma::C420,
++                chroma,
+                 bits: p.bit_depth,
+                 alpha: None,
+             },
+diff -ruN orig/filmcraft-main/crates/hevc/README.md filmcraft-main/crates/hevc/README.md
+--- orig/filmcraft-main/crates/hevc/README.md	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/README.md	2026-10-26 04:41:45.207197988 +0000
+@@ -31,7 +31,8 @@
+ | Frame-level multithreading (CTB-row granularity dependencies) | done |
+ | Draft mode (non-reference pictures skip deblocking / SAO; reduced-resolution playback only) | done |
+ | Tiles / WPP | parsed and decoded sequentially within a picture (parallelism is across pictures) |
+-| 4:2:2 / 4:4:4 / monochrome, range-extension tools (RExt), 12-bit+ with extended precision | not yet (`Error::Unsupported`) |
++| 4:2:2 (Main 4:2:2 10 without range-extension tools: stacked chroma blocks and second cbf flags, Table 8-3 intra mode mapping, vertical chroma MV scaling, `QpC = Min(qPi, 51)`, 4:2:2 chroma deblocking / SAO geometry) | implemented, tests in `tests/it/yuv422.rs` (ffmpeg oracle; not yet run) |
++| 4:4:4 / monochrome, range-extension tools (RExt), 12-bit+ with extended precision | not yet (`Error::Unsupported`) |
+ | SCC, multilayer (SHVC / MV-HEVC), 3D extensions | not supported (layers > 0 are ignored) |
+ 
+ ## API
+@@ -190,10 +191,8 @@
+ 
+ ## Known gaps
+ 
+-- 4:2:2 (Main 4:2:2 10, RExt) is the next step: chroma geometry is 4:2:0-specific in `slicedec`
+-  (chroma TU placement, second chroma cbf flags, Table 8-3 intra mode mapping), `inter` (vertical
+-  chroma MV scaling), `filter` (chroma edge spacing, QpC = Min(qPi, 51)) and `picture`. Range
+-  extension tools (implicit / explicit RDPCM, cross-component prediction, extended precision,
++- 4:2:2 is decoded (see the status table); `Picture::chroma_format_idc` says which chroma layout
++  a picture has. Range extension tools (implicit / explicit RDPCM, cross-component prediction, extended precision,
+   persistent Rice adaptation, bypass alignment, chroma QP offset lists) are rejected with
+   `Error::Unsupported`.
+ - Tiles and WPP substreams are decoded sequentially (entry points are parsed but the decoder finds
+diff -ruN orig/filmcraft-main/crates/hevc/src/decoder.rs filmcraft-main/crates/hevc/src/decoder.rs
+--- orig/filmcraft-main/crates/hevc/src/decoder.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/decoder.rs	2026-10-25 23:53:43.285294648 +0000
+@@ -387,6 +387,7 @@
+             Some(a) => {
+                 a.width != sps.width
+                     || a.height != sps.height
++                    || a.chroma_format_idc != sps.chroma_format_idc
+                     || a.bit_depth_luma != sps.bit_depth_luma
+                     || a.bit_depth_chroma != sps.bit_depth_chroma
+                     || a.log2_ctb != sps.log2_ctb
+@@ -417,7 +418,7 @@
+         let max_lsb = sps.max_poc_lsb();
+         let poc = self.poc_state.compute(sh, max_lsb, irap_no_rasl);
+         let (w, h) = (sps.width as usize, sps.height as usize);
+-        let template = Frame::new(0, 0, w, h, sps.log2_ctb, sps.bit_depth_luma, sps.bit_depth_chroma);
++        let template = Frame::with_chroma(0, 0, w, h, sps.log2_ctb, sps.bit_depth_luma, sps.bit_depth_chroma, sps.chroma_shifts());
+         let next_id = &mut self.next_id;
+         let gray_reference = &mut self.gray_reference;
+         let mut missing = 0u64;
+@@ -446,7 +447,7 @@
+         let _ = scaling;
+         let id = self.next_id;
+         self.next_id += 1;
+-        let frame = Arc::new(Frame::new(id, poc, w, h, sps.log2_ctb, sps.bit_depth_luma, sps.bit_depth_chroma));
++        let frame = Arc::new(Frame::with_chroma(id, poc, w, h, sps.log2_ctb, sps.bit_depth_luma, sps.bit_depth_chroma, sps.chroma_shifts()));
+         let output = sh.pic_output && !(hdr.is_rasl() && self.skip_rasl);
+         // Draft mode: a sub-layer non-reference picture of the highest sub-layer is never used
+         // for prediction, so its in-loop filters can be left out without changing anything else.
+@@ -612,7 +613,9 @@
+ fn make_picture(o: &Output<FrameRef>) -> Picture {
+     let (cx, cy, cw, ch) = o.meta.crop;
+     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
+-    let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(2));
++    let (sx, sy) = (o.frame.csx, o.frame.csy);
++    let (ccw, cch) = (cw.div_ceil(1 << sx), ch.div_ceil(1 << sy));
++    let chroma_format_idc = if sy == 1 { 1 } else if sx == 1 { 2 } else { 3 };
+     let bd = o.meta.bit_depth;
+     let (y, u, v) = o.frame.cropped_planes((cx, cy, cw, ch), bd <= 8);
+     Picture {
+@@ -620,6 +623,7 @@
+         height: ch as u32,
+         chroma_width: ccw as u32,
+         chroma_height: cch as u32,
++        chroma_format_idc,
+         bit_depth: bd,
+         y,
+         u,
+diff -ruN orig/filmcraft-main/crates/hevc/src/filter.rs filmcraft-main/crates/hevc/src/filter.rs
+--- orig/filmcraft-main/crates/hevc/src/filter.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/filter.rs	2026-10-25 23:55:39.564226124 +0000
+@@ -7,7 +7,7 @@
+ use crate::picture::{ColMv, FrameRow, Sample};
+ use crate::slicedec::{E_PU_H, E_PU_V, E_TU_H, E_TU_V, F_CBF, F_CODED, F_INTRA, F_NOFILTER, MvField, PicState};
+ use crate::spec_tables::{BETA_TABLE, TC_TABLE};
+-use crate::tables::qpc_420;
++use crate::tables::qpc;
+ 
+ /// Called after each decoded CTB of CTB row `ry`.
+ pub fn ctb_decoded<S: Sample>(pic: &mut PicState<S>, ry: usize) {
+@@ -164,10 +164,11 @@
+             filter_luma(&mut pic.planes[0], y * w + x, 1, w, tc, beta, nfp, nfq, bd);
+         }
+     }
+-    // chroma vertical edges (8x8 chroma grid = 16 luma samples), bS == 2 only
+-    let cw = pic.cwidth;
+-    for by in (y0 / 4..y1 / 4).step_by(2) {
+-        for bx in (4..w4).step_by(4) {
++    // chroma vertical edges (8x8 chroma grid = 16 luma samples), bS == 2 only. A segment is 4
++    // chroma lines: 8 luma lines in 4:2:0, 4 in 4:2:2.
++    let (cw, csx, csy, cat) = (pic.cwidth, pic.csx as usize, pic.csy as usize, pic.chroma_type);
++    for by in (y0 / 4..y1 / 4).step_by(1 << csy) {
++        for bx in (2usize << csx..w4).step_by(2 << csx) {
+             if bs_v[(by - y0 / 4) * w4 + bx] != 2 {
+                 continue;
+             }
+@@ -178,9 +179,9 @@
+             let (nfp, nfq) = (p.flags & F_NOFILTER != 0, q.flags & F_NOFILTER != 0);
+             for (c, off) in [(1, cb_off), (2, cr_off)] {
+                 let qpi = ((p.qp as i32 + q.qp as i32 + 1) >> 1) + off;
+-                let qt = (qpc_420(qpi) + 2 + tc_off).clamp(0, 53);
++                let qt = (qpc(cat, qpi) + 2 + tc_off).clamp(0, 53);
+                 let tc = (TC_TABLE[qt as usize] as i32) << (bdc - 8);
+-                filter_chroma(&mut pic.planes[c], (y / 2) * cw + x / 2, 1, cw, tc, nfp, nfq, bdc);
++                filter_chroma(&mut pic.planes[c], (y >> csy) * cw + (x >> csx), 1, cw, tc, nfp, nfq, bdc);
+             }
+         }
+     }
+@@ -208,7 +209,8 @@
+             filter_luma(&mut pic.planes[0], y * w + x, w, 1, tc, beta, nfp, nfq, bd);
+         }
+     }
+-    for by in (y0 / 4..y1 / 4).filter(|b| b % 4 == 0 && *b > 0) {
++    // chroma horizontal edges: every 8 chroma lines (16 luma lines in 4:2:0, 8 in 4:2:2)
++    for by in (y0 / 4..y1 / 4).filter(|b| b % (2 << csy) == 0 && *b > 0) {
+         for bx in (0..w4).step_by(2) {
+             if bs_h[(by - y0 / 4) * w4 + bx] != 2 {
+                 continue;
+@@ -220,9 +222,9 @@
+             let (nfp, nfq) = (p.flags & F_NOFILTER != 0, q.flags & F_NOFILTER != 0);
+             for (c, off) in [(1, cb_off), (2, cr_off)] {
+                 let qpi = ((p.qp as i32 + q.qp as i32 + 1) >> 1) + off;
+-                let qt = (qpc_420(qpi) + 2 + tc_off).clamp(0, 53);
++                let qt = (qpc(cat, qpi) + 2 + tc_off).clamp(0, 53);
+                 let tc = (TC_TABLE[qt as usize] as i32) << (bdc - 8);
+-                filter_chroma(&mut pic.planes[c], (y / 2) * cw + x / 2, cw, 1, tc, nfp, nfq, bdc);
++                filter_chroma(&mut pic.planes[c], (y >> csy) * cw + (x >> csx), cw, 1, tc, nfp, nfq, bdc);
+             }
+         }
+     }
+@@ -361,9 +363,9 @@
+     let ctb = 1usize << pic.log2_ctb;
+     let mut out: [Vec<S>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+     for c in 0..3 {
+-        let (w, h, cs) = if c == 0 { (pic.width, pic.height, ctb) } else { (pic.cwidth, pic.cheight, ctb / 2) };
+-        let y0 = r * cs;
+-        let y1 = (y0 + cs).min(h);
++        let (w, h, csw, csh) = if c == 0 { (pic.width, pic.height, ctb, ctb) } else { (pic.cwidth, pic.cheight, ctb >> pic.csx, ctb >> pic.csy) };
++        let y0 = r * csh;
++        let y1 = (y0 + csh).min(h);
+         out[c] = pic.planes[c][y0 * w..y1 * w].to_vec();
+         for rx in (0..pic.wctb).filter(|_| !pic.draft) {
+             let rs = r * pic.wctb + rx;
+@@ -379,8 +381,8 @@
+             if p.type_idx[c] == 0 {
+                 continue;
+             }
+-            let x0 = rx * cs;
+-            let x1 = (x0 + cs).min(w);
++            let x0 = rx * csw;
++            let x1 = (x0 + csw).min(w);
+             sao_ctb(pic, c, rs, x0, x1, y0, y1, w, h, &p, &mut out[c]);
+         }
+     }
+@@ -403,14 +405,14 @@
+ ) {
+     let bd = if c == 0 { pic.bd_y } else { pic.bd_c };
+     let max = (1i32 << bd) - 1;
+-    let sc = if c == 0 { 0 } else { 1 };
++    let (sx, sy) = if c == 0 { (0usize, 0usize) } else { (pic.csx as usize, pic.csy as usize) };
+     let offs = p.offsets[c].map(|v| v as i32);
+     // samples of CUs that must not be modified
+-    let nofilter = |pic: &PicState<S>, x: usize, y: usize| pic.blk[((y << sc) >> 2) * pic.w4 + ((x << sc) >> 2)].flags & F_NOFILTER != 0;
++    let nofilter = |pic: &PicState<S>, x: usize, y: usize| pic.blk[((y << sy) >> 2) * pic.w4 + ((x << sx) >> 2)].flags & F_NOFILTER != 0;
+     let any_nofilter = {
+         let mut a = false;
+-        for by in ((y0 << sc) >> 2)..(((y1 << sc) + 3) >> 2).min(pic.h4) {
+-            for bx in ((x0 << sc) >> 2)..(((x1 << sc) + 3) >> 2).min(pic.w4) {
++        for by in ((y0 << sy) >> 2)..(((y1 << sy) + 3) >> 2).min(pic.h4) {
++            for bx in ((x0 << sx) >> 2)..(((x1 << sx) + 3) >> 2).min(pic.w4) {
+                 a |= pic.blk[by * pic.w4 + bx].flags & F_NOFILTER != 0;
+             }
+         }
+@@ -446,12 +448,12 @@
+     };
+     // Neighbouring CTBs whose samples may not be used (other slice / tile without cross-boundary
+     // filtering), checked per sample only near CTB borders.
+-    let s = pic.log2_ctb as usize - sc;
++    let (shx, shy) = (pic.log2_ctb as usize - sx, pic.log2_ctb as usize - sy);
+     let cur_slice = pic.ctb_slice[rs];
+     let lf_cur = pic.slices[cur_slice as usize].lf_across;
+     let cur_ts = pic.layout.rs_to_ts[rs];
+     let cross_ok = |pic: &PicState<S>, xn: usize, yn: usize| -> bool {
+-        let nrs = (yn >> s) * pic.wctb + (xn >> s);
++        let nrs = (yn >> shy) * pic.wctb + (xn >> shx);
+         if nrs == rs {
+             return true;
+         }
+@@ -601,7 +603,7 @@
+ fn publish_row<S: Sample>(pic: &mut PicState<S>, r: usize) {
+     let ctb = 1usize << pic.log2_ctb;
+     let (y0, y1) = (r * ctb, ((r + 1) * ctb).min(pic.height));
+-    let (c0, c1) = (y0 / 2, y1.div_ceil(2));
++    let (c0, c1) = (y0 >> pic.csy, y1.div_ceil(1 << pic.csy));
+     let (w, cw) = (pic.width, pic.cwidth);
+     let w16 = pic.width.div_ceil(16);
+     let rows16 = (y1 - y0).div_ceil(16);
+diff -ruN orig/filmcraft-main/crates/hevc/src/inter.rs filmcraft-main/crates/hevc/src/inter.rs
+--- orig/filmcraft-main/crates/hevc/src/inter.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/inter.rs	2026-10-25 23:57:14.714291776 +0000
+@@ -242,14 +242,16 @@
+     predict_block::<S, 8>(f, 0, (xi - 3, yi - 3), (fx, fy), (&LUMA_FILTER[fx], &LUMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
+ }
+ 
+-/// Chroma prediction samples of a w x h chroma block at chroma position (x, y) with a 1/8-sample
+-/// vector (4:2:0).
++/// Chroma prediction samples of a w x h chroma block at chroma position (x, y) with a vector `mv`
++/// in 1/8 samples of the chroma plane (8.5.3.2.10: `mvLX * 2 / SubWidthC` horizontally and
++/// `mvLX * 2 / SubHeightC` vertically, so 4:2:0 uses the luma vector as is and 4:2:2 doubles the
++/// vertical component).
+ #[allow(clippy::too_many_arguments)]
+-pub fn mc_chroma<S: Sample>(f: &Frame, c: usize, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, out: &mut [i16], sc: &mut McScratch) {
++pub fn mc_chroma<S: Sample>(f: &Frame, c: usize, x: i32, y: i32, mv: [i32; 2], w: usize, h: usize, out: &mut [i16], sc: &mut McScratch) {
+     let bd = f.bit_depth_c;
+     let (fx, fy) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
+-    let xi = x + (mv[0] as i32 >> 3);
+-    let yi = y + (mv[1] as i32 >> 3);
++    let xi = x + (mv[0] >> 3);
++    let yi = y + (mv[1] >> 3);
+     let shift1 = bd.min(12) - 8;
+     let shift3 = 14 - bd;
+     predict_block::<S, 4>(f, c + 1, (xi - 1, yi - 1), (fx, fy), (&CHROMA_FILTER[fx], &CHROMA_FILTER[fy]), (w, h), (shift1, shift3), out, sc);
+@@ -554,7 +556,7 @@
+                     mc_luma::<S>(&f, x, y, mv, w, h, &mut a, &mut sc);
+                     interpolate::<i16, 8>(&wrows, &mut tmp, fx, fy, &LUMA_FILTER[fx], &LUMA_FILTER[fy], w, h, shift1, shift3, &mut b);
+                 } else {
+-                    mc_chroma::<S>(&f, c - 1, x, y, mv, w, h, &mut a, &mut sc);
++                    mc_chroma::<S>(&f, c - 1, x, y, [mv[0] as i32, mv[1] as i32], w, h, &mut a, &mut sc);
+                     interpolate::<i16, 4>(&wrows, &mut tmp, fx, fy, &CHROMA_FILTER[fx], &CHROMA_FILTER[fy], w, h, shift1, shift3, &mut b);
+                 }
+                 assert_eq!(a, b, "plane {c} bd {bd} at ({x}, {y}) mv {mv:?} {w}x{h}");
+@@ -587,7 +589,7 @@
+                 assert!(a.iter().any(|&v| v != S::default()) || w * h < 8);
+                 for c in 1..3 {
+                     let (cw, ch) = (w / 2, h / 2);
+-                    mc_chroma::<S>(&f, c - 1, 0, 0, [(x * 8) as i16, (y * 8) as i16], cw, ch, &mut pred, &mut sc);
++                    mc_chroma::<S>(&f, c - 1, 0, 0, [x * 8, y * 8], cw, ch, &mut pred, &mut sc);
+                     let (mut a, mut b) = (vec![S::default(); cw * ch], vec![S::default(); cw * ch]);
+                     put_uni(&pred, cw, ch, bd, &mut a, cw);
+                     f.copy_block(c, x, y, cw, ch, &mut b, cw);
+diff -ruN orig/filmcraft-main/crates/hevc/src/lib.rs filmcraft-main/crates/hevc/src/lib.rs
+--- orig/filmcraft-main/crates/hevc/src/lib.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/lib.rs	2026-10-25 23:53:43.285946496 +0000
+@@ -100,7 +100,7 @@
+     }
+ }
+ 
+-/// A decoded, cropped picture in planar 4:2:0.
++/// A decoded, cropped picture in planar 4:2:0 or 4:2:2.
+ #[derive(Clone, Debug)]
+ pub struct Picture {
+     /// Cropped luma width.
+@@ -109,6 +109,8 @@
+     pub height: u32,
+     pub chroma_width: u32,
+     pub chroma_height: u32,
++    /// 1 (4:2:0) or 2 (4:2:2): the chroma planes are `chroma_width` x `chroma_height` samples.
++    pub chroma_format_idc: u32,
+     /// Luma bit depth (chroma uses the same storage type).
+     pub bit_depth: u32,
+     pub y: Plane,
+diff -ruN orig/filmcraft-main/crates/hevc/src/params.rs filmcraft-main/crates/hevc/src/params.rs
+--- orig/filmcraft-main/crates/hevc/src/params.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/params.rs	2026-10-25 23:53:29.853730263 +0000
+@@ -618,6 +618,11 @@
+     pub fn sub_height_c(&self) -> u32 {
+         if self.chroma_format_idc == 1 { 2 } else { 1 }
+     }
++    /// log2 of (SubWidthC, SubHeightC): a chroma plane is the luma plane shifted right by these
++    /// (4:2:0 = (1, 1), 4:2:2 = (1, 0), 4:4:4 and monochrome = (0, 0)).
++    pub fn chroma_shifts(&self) -> (u32, u32) {
++        (self.sub_width_c().trailing_zeros(), self.sub_height_c().trailing_zeros())
++    }
+     pub fn ctb_size(&self) -> u32 {
+         1 << self.log2_ctb
+     }
+@@ -644,8 +649,8 @@
+ 
+     /// Features this decoder does not handle yet.
+     pub fn check_supported(&self) -> Result<()> {
+-        if self.chroma_format_idc != 1 {
+-            return unsupported(format!("chroma_format_idc {} (only 4:2:0)", self.chroma_format_idc));
++        if self.chroma_format_idc != 1 && self.chroma_format_idc != 2 {
++            return unsupported(format!("chroma_format_idc {} (only 4:2:0 and 4:2:2)", self.chroma_format_idc));
+         }
+         if self.bit_depth_luma > 12 || self.bit_depth_chroma > 12 {
+             return unsupported(format!("bit depth {}/{}", self.bit_depth_luma, self.bit_depth_chroma));
+diff -ruN orig/filmcraft-main/crates/hevc/src/picture.rs filmcraft-main/crates/hevc/src/picture.rs
+--- orig/filmcraft-main/crates/hevc/src/picture.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/picture.rs	2026-10-25 23:57:14.713282490 +0000
+@@ -128,6 +128,9 @@
+     pub height: usize,
+     pub cwidth: usize,
+     pub cheight: usize,
++    /// log2 of SubWidthC / SubHeightC (the chroma planes are the luma size shifted right by these).
++    pub csx: u32,
++    pub csy: u32,
+     pub log2_ctb: u32,
+     pub bit_depth: u32,
+     pub bit_depth_c: u32,
+@@ -148,13 +151,21 @@
+ }
+ 
+ impl Frame {
++    /// A 4:2:0 frame.
+     pub fn new(id: u32, poc: i32, width: usize, height: usize, log2_ctb: u32, bit_depth: u32, bit_depth_c: u32) -> Self {
++        Self::with_chroma(id, poc, width, height, log2_ctb, bit_depth, bit_depth_c, (1, 1))
++    }
++
++    /// A frame whose chroma planes are the luma size shifted right by `(csx, csy)`.
++    #[allow(clippy::too_many_arguments)]
++    pub fn with_chroma(id: u32, poc: i32, width: usize, height: usize, log2_ctb: u32, bit_depth: u32, bit_depth_c: u32, (csx, csy): (u32, u32)) -> Self {
++        let (csx, csy) = (csx.min(1), csy.min(1));
+         let n = height.div_ceil(1 << log2_ctb);
+         fn cells<S: Sample>(n: usize) -> Rows {
+             S::wrap_rows((0..n).map(|_| OnceLock::new()).collect())
+         }
+         let rows = if stores_u8(bit_depth, bit_depth_c) { cells::<u8>(n) } else { cells::<u16>(n) };
+-        Frame { id, poc, width, height, cwidth: width / 2, cheight: height / 2, log2_ctb, bit_depth, bit_depth_c, rows }
++        Frame { id, poc, width, height, cwidth: width >> csx, cheight: height >> csy, csx, csy, log2_ctb, bit_depth, bit_depth_c, rows }
+     }
+ 
+     pub fn num_rows(&self) -> usize {
+@@ -239,7 +250,7 @@
+     /// Copy a w x h window of chroma component `c` (0 = Cb, 1 = Cr) with edge replication.
+     pub fn chroma_window<S: Sample>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [i16], os: usize) {
+         let (cw, ch) = (self.cwidth as i32, self.cheight as i32);
+-        let sh = self.log2_ctb - 1;
++        let sh = self.log2_ctb - self.csy;
+         let mask = (1i32 << sh) - 1;
+         for r in 0..h {
+             let yy = (y0 + r as i32).clamp(0, ch - 1);
+@@ -255,7 +266,7 @@
+     /// (8-228, 8-229): the reference window of a prediction block without copying it. False (and
+     /// `rows` partly filled) when the runs are not inside the picture horizontally.
+     pub fn window_rows<'f, S: Sample>(&'f self, c: usize, x0: i32, y0: i32, w: usize, rows: &mut [&'f [S]]) -> bool {
+-        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - 1) };
++        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - self.csy) };
+         let Some(x) = usize::try_from(x0).ok().filter(|&x| x.saturating_add(w) <= pw) else { return false };
+         let mask = (1usize << sh) - 1;
+         let max_y = ph as i32 - 1;
+@@ -286,7 +297,7 @@
+     /// (stride `ds`), samples outside the picture replicated from its edges (8-228, 8-229).
+     #[allow(clippy::too_many_arguments)]
+     pub fn copy_block<S: Sample>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, dst: &mut [S], ds: usize) {
+-        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - 1) };
++        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - self.csy) };
+         let inside = usize::try_from(x0).ok().filter(|&x| x.saturating_add(w) <= pw);
+         for (r, d) in dst.chunks_mut(ds).take(h).enumerate() {
+             let yy = y0.saturating_add(r as i32).min(ph as i32 - 1).max(0) as usize;
+@@ -343,8 +354,9 @@
+             let Some(row) = self.row::<S>(r / ctb) else { break };
+             put(&mut y, &row.y, (r % ctb) * self.width + cx, cw);
+         }
+-        let (ccx, ccy, ccw, cch) = (cx / 2, cy / 2, cw.div_ceil(2), ch.div_ceil(2));
+-        let cctb = ctb / 2;
++        let (sx, sy) = (self.csx, self.csy);
++        let (ccx, ccy, ccw, cch) = (cx >> sx, cy >> sy, cw.div_ceil(1 << sx), ch.div_ceil(1 << sy));
++        let cctb = ctb >> sy;
+         u.reserve_exact(ccw.saturating_mul(cch));
+         v.reserve_exact(ccw.saturating_mul(cch));
+         for r in ccy..ccy.saturating_add(cch) {
+@@ -367,7 +379,7 @@
+                     continue;
+                 }
+                 let lines = f.row_lines(r);
+-                let clines = lines.div_ceil(2);
++                let clines = lines.div_ceil(1 << f.csy);
+                 f.publish(
+                     r,
+                     FrameRow::<S> {
+@@ -387,7 +399,7 @@
+ 
+     /// A mid-grey frame with the geometry of `like`.
+     pub fn gray(id: u32, poc: i32, like: &Frame) -> Frame {
+-        let f = Frame::new(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c);
++        let f = Frame::with_chroma(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c, (like.csx, like.csy));
+         f.publish_gray();
+         f
+     }
+@@ -402,6 +414,8 @@
+             height: self.height,
+             cwidth: self.cwidth,
+             cheight: self.cheight,
++            csx: self.csx,
++            csy: self.csy,
+             log2_ctb: self.log2_ctb,
+             bit_depth: self.bit_depth,
+             bit_depth_c: self.bit_depth_c,
+@@ -419,8 +433,8 @@
+             for r in 0..f.num_rows() {
+                 let lines = f.row_lines(r);
+                 let (y0, y1) = (r * ctb * f.width, (r * ctb + lines) * f.width);
+-                let clines = lines.div_ceil(2);
+-                let (c0, c1) = (r * ctb / 2 * f.cwidth, (r * ctb / 2 + clines) * f.cwidth);
++                let clines = lines.div_ceil(1 << f.csy);
++                let (c0, c1) = (((r * ctb) >> f.csy) * f.cwidth, (((r * ctb) >> f.csy) + clines) * f.cwidth);
+                 f.publish(
+                     r,
+                     FrameRow::<S> {
+@@ -432,7 +446,7 @@
+                 );
+             }
+         }
+-        let f = Frame::new(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c);
++        let f = Frame::with_chroma(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c, (like.csx, like.csy));
+         match &f.rows {
+             Rows::U8(_) => fill::<u8>(&f, y, cb, cr),
+             Rows::U16(_) => fill::<u16>(&f, y, cb, cr),
+@@ -550,6 +564,37 @@
+         (y, cb, cr)
+     }
+ 
++    /// A 4:2:2 frame keeps full-height, half-width chroma planes and crops them exactly
++    /// (SubHeightC = 1: no vertical halving of the crop window).
++    #[test]
++    fn chroma_422_geometry_and_crop() {
++        let (w, h) = (40usize, 36usize);
++        let crop = (2usize, 5usize, 33usize, 27usize);
++        let bd = 10u32;
++        let (y, _, _) = planes(w, h, bd, 0x1234_5678_9abc_def1);
++        let (cwid, chei) = (w / 2, h);
++        let (_, cb, cr): (Vec<u16>, Vec<u16>, Vec<u16>) = {
++            let (_, a, _) = planes(cwid * 2, chei * 2, bd, 7);
++            let (_, b, _) = planes(cwid * 2, chei * 2, bd, 11);
++            (Vec::new(), a[..cwid * chei].to_vec(), b[..cwid * chei].to_vec())
++        };
++        let like = Frame::with_chroma(0, 0, w, h, 4, bd, bd, (1, 0));
++        assert_eq!((like.cwidth, like.cheight), (cwid, chei));
++        let f = Frame::from_planes(1, 0, &like, &y, &cb, &cr);
++        assert!(f.is_complete());
++        let (_, pu, pv) = f.cropped_planes(crop, false);
++        let (cx, cy, cw, ch) = crop;
++        let (ccw, cch) = (cw.div_ceil(2), ch);
++        let want = |p: &[u16]| -> Vec<u16> { (cy..cy + cch).flat_map(|r| p[r * cwid + cx / 2..r * cwid + cx / 2 + ccw].to_vec()).collect() };
++        let got = |p: &Plane| -> Vec<u16> { (0..p.len()).map(|i| p.get(i)).collect() };
++        assert_eq!(got(&pu), want(&cb), "cb");
++        assert_eq!(got(&pv), want(&cr), "cr");
++        // a grey frame of the same geometry has full-height chroma rows too
++        let g = Frame::gray(2, 0, &like);
++        assert!(g.is_complete());
++        assert_eq!((g.cwidth, g.cheight, g.csx, g.csy), (cwid, chei, 1, 0));
++    }
++
+     /// 8-bit pictures are stored as `u8`, deeper ones as `u16`, and both crop back to exactly the
+     /// samples they were given.
+     #[test]
+diff -ruN orig/filmcraft-main/crates/hevc/src/slicedec.rs filmcraft-main/crates/hevc/src/slicedec.rs
+--- orig/filmcraft-main/crates/hevc/src/slicedec.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/slicedec.rs	2026-10-25 23:54:59.129285277 +0000
+@@ -11,7 +11,7 @@
+ use crate::picture::{FrameRef, RefPic, Sample};
+ use crate::slice::{SliceHeader, SliceType};
+ use crate::spec_tables::*;
+-use crate::tables::{CTX_IDX_MAP, LEVEL_SCALE, SCAN_4, qpc_420, scan_order};
++use crate::tables::{CTX_IDX_MAP, INTRA_MODE_422, LEVEL_SCALE, SCAN_4, qpc, scan_order};
+ use crate::transform;
+ use std::sync::Arc;
+ 
+@@ -106,6 +106,11 @@
+     pub height: usize,
+     pub cwidth: usize,
+     pub cheight: usize,
++    /// log2 of SubWidthC / SubHeightC (chroma plane = luma size >> these).
++    pub csx: u32,
++    pub csy: u32,
++    /// ChromaArrayType (1 = 4:2:0, 2 = 4:2:2).
++    pub chroma_type: u32,
+     pub w4: usize,
+     pub h4: usize,
+     pub log2_ctb: u32,
+@@ -139,7 +144,9 @@
+ impl<S: Sample> PicState<S> {
+     pub fn new(frame: FrameRef, sps: Arc<Sps>, pps: Arc<Pps>, layout: Arc<Layout>, scaling: Option<Arc<Vec<Vec<u8>>>>) -> Self {
+         let (width, height) = (sps.width as usize, sps.height as usize);
+-        let (cwidth, cheight) = (width / 2, height / 2);
++        let (csx, csy) = sps.chroma_shifts();
++        let chroma_type = sps.chroma_array_type();
++        let (cwidth, cheight) = (width >> csx, height >> csy);
+         let (w4, h4) = (width.div_ceil(4), height.div_ceil(4));
+         let log2_ctb = sps.log2_ctb;
+         let (wctb, hctb) = (sps.pic_width_in_ctbs() as usize, sps.pic_height_in_ctbs() as usize);
+@@ -156,6 +163,9 @@
+             height,
+             cwidth,
+             cheight,
++            csx,
++            csy,
++            chroma_type,
+             w4,
+             h4,
+             log2_ctb,
+@@ -627,8 +637,8 @@
+         let offc = 6 * (self.pic.bd_c as i32 - 8);
+         let qpi_cb = (self.qp_y + self.pps.cb_qp_offset + self.sh.cb_qp_offset).clamp(-offc, 57);
+         let qpi_cr = (self.qp_y + self.pps.cr_qp_offset + self.sh.cr_qp_offset).clamp(-offc, 57);
+-        self.qp_cb = qpc_420(qpi_cb) + offc;
+-        self.qp_cr = qpc_420(qpi_cr) + offc;
++        self.qp_cb = qpc(self.pic.chroma_type, qpi_cb) + offc;
++        self.qp_cr = qpc(self.pic.chroma_type, qpi_cr) + offc;
+     }
+ 
+     fn coding_unit(&mut self, x0: i32, y0: i32, log2: u32, depth: u32) -> Result<()> {
+@@ -690,7 +700,7 @@
+             }
+             self.parse_intra_modes(x0, y0, n, part)?;
+             self.max_trafo_depth = self.sps.max_th_depth_intra + self.intra_split as u32;
+-            self.transform_tree(x0, y0, x0, y0, log2, 0, 0, [true, true])?;
++            self.transform_tree(x0, y0, x0, y0, log2, 0, 0, [[true; 2]; 2])?;
+         } else {
+             self.intra_split = false;
+             let mut merge2nx2n = false;
+@@ -721,7 +731,7 @@
+             let root_cbf = if !merge2nx2n { self.dd(RQT_ROOT_CBF) == 1 } else { true };
+             if root_cbf {
+                 self.max_trafo_depth = self.sps.max_th_depth_inter;
+-                self.transform_tree(x0, y0, x0, y0, log2, 0, 0, [true, true])?;
++                self.transform_tree(x0, y0, x0, y0, log2, 0, 0, [[true; 2]; 2])?;
+             }
+         }
+         self.finish_cu(x0, y0, n);
+@@ -794,7 +804,9 @@
+         let data = self.c.data();
+         let n = 1usize << log2;
+         let (bl, bc) = (self.sps.pcm_bit_depth_luma, self.sps.pcm_bit_depth_chroma);
+-        let total_bits = n * n * bl as usize + 2 * (n / 2) * (n / 2) * bc as usize;
++        let (csx, csy) = (self.pic.csx as usize, self.pic.csy as usize);
++        let (cn_w, cn_h) = (n >> csx, n >> csy);
++        let total_bits = n * n * bl as usize + 2 * cn_w * cn_h * bc as usize;
+         ensure!(start + total_bits.div_ceil(8) <= data.len(), "PCM samples truncated");
+         let mut r = filmcraft_bitstream::BitReader::new(&data[start..]);
+         let (sy, sc) = (self.pic.bd_y - bl, self.pic.bd_c - bc);
+@@ -807,10 +819,10 @@
+         }
+         let cw = self.pic.cwidth;
+         for c in 1..3 {
+-            for y in 0..n / 2 {
+-                for x in 0..n / 2 {
++            for y in 0..cn_h {
++                for x in 0..cn_w {
+                     let v = r.read_bits(bc)? as u16;
+-                    self.pic.planes[c][(y0 as usize / 2 + y) * cw + x0 as usize / 2 + x] = S::from_u16(v << sc);
++                    self.pic.planes[c][((y0 as usize >> csy) + y) * cw + (x0 as usize >> csx) + x] = S::from_u16(v << sc);
+                 }
+             }
+         }
+@@ -878,20 +890,22 @@
+                 self.fill_blk(xp, yp, pb, pb, |b| b.ipm = mode as u8);
+             }
+         }
+-        // chroma mode (4:2:0: one per CU, derived from the first PU's luma mode)
++        // chroma mode (4:2:0 / 4:2:2: one per CU, derived from the first PU's luma mode)
+         let icpm = if self.dd(INTRA_CHROMA) == 0 { 4 } else { self.bypass_bits(2) };
+         let luma = self.pic.blk_at(x0, y0).ipm as u32;
+-        self.intra_chroma_mode = match icpm {
++        let derived = match icpm {
+             4 => luma,
+             _ => {
+                 let m = [0, 26, 10, 1][icpm as usize];
+                 if m == luma { 34 } else { m }
+             }
+         };
++        // 4:2:2: Table 8-3 remaps the mode for the half-width chroma plane
++        self.intra_chroma_mode = if self.pic.chroma_type == 2 { INTRA_MODE_422.get(derived as usize).map_or(derived, |&m| m as u32) } else { derived };
+         Ok(())
+     }
+ 
+-    fn transform_tree(&mut self, x0: i32, y0: i32, xb: i32, yb: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf_c: [bool; 2]) -> Result<()> {
++    fn transform_tree(&mut self, x0: i32, y0: i32, xb: i32, yb: i32, log2: u32, depth: u32, blk_idx: u32, parent_cbf_c: [[bool; 2]; 2]) -> Result<()> {
+         let split = if log2 <= self.sps.log2_max_tb && log2 > self.sps.log2_min_tb && depth < self.max_trafo_depth && !(self.intra_split && depth == 0) {
+             self.dd(SPLIT_TRANSFORM + (5 - log2 as usize)) == 1
+         } else {
+@@ -899,18 +913,24 @@
+             let inter_split = self.sps.max_th_depth_inter == 0 && !self.cu_intra && self.cu_part != PartMode::P2Nx2N && depth == 0;
+             log2 > self.sps.log2_max_tb || (self.intra_split && depth == 0) || inter_split
+         };
+-        let mut cbf_c = [false, false];
++        // cbf_cb / cbf_cr: [component][block]; 4:2:2 codes a second flag for the lower of the two
++        // stacked chroma blocks (7.3.8.8) where the transform tree does not split further
++        let second = self.pic.chroma_type == 2 && (!split || log2 == 3);
++        let mut cbf_c = [[false; 2]; 2];
+         if log2 > 2 {
+             for (c, cbf) in cbf_c.iter_mut().enumerate() {
+-                if depth == 0 || parent_cbf_c[c] {
+-                    *cbf = self.dd(CBF_CHROMA + depth as usize) == 1;
++                if depth == 0 || parent_cbf_c[c][0] {
++                    cbf[0] = self.dd(CBF_CHROMA + depth as usize) == 1;
++                    if second {
++                        cbf[1] = self.dd(CBF_CHROMA + depth as usize) == 1;
++                    }
+                 }
+             }
+         } else {
+             // 4x4 luma blocks: chroma cbfs are those of the parent (coded at blkIdx 3)
+             cbf_c = parent_cbf_c;
+             if depth == 0 {
+-                cbf_c = [false, false];
++                cbf_c = [[false; 2]; 2];
+             }
+         }
+         if split {
+@@ -921,7 +941,7 @@
+             self.transform_tree(x0 + h, y0 + h, x0, y0, log2 - 1, depth + 1, 3, cbf_c)?;
+             return Ok(());
+         }
+-        let cbf_luma = if self.cu_intra || depth != 0 || cbf_c[0] || cbf_c[1] { self.dd(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
++        let cbf_luma = if self.cu_intra || depth != 0 || cbf_c.iter().flatten().any(|&b| b) { self.dd(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
+         let n = 1 << log2;
+         if depth > 0 {
+             self.mark_edges(x0, y0, n, n, E_TU_V, E_TU_H);
+@@ -929,10 +949,10 @@
+         self.transform_unit(x0, y0, xb, yb, log2, blk_idx, cbf_luma, cbf_c)
+     }
+ 
+-    fn transform_unit(&mut self, x0: i32, y0: i32, xb: i32, yb: i32, log2: u32, blk_idx: u32, cbf_luma: bool, cbf_c: [bool; 2]) -> Result<()> {
++    fn transform_unit(&mut self, x0: i32, y0: i32, xb: i32, yb: i32, log2: u32, blk_idx: u32, cbf_luma: bool, cbf_c: [[bool; 2]; 2]) -> Result<()> {
+         let n = 1i32 << log2;
+         let chroma_here = log2 > 2 || blk_idx == 3;
+-        let cbf_chroma = cbf_c[0] || cbf_c[1];
++        let cbf_chroma = cbf_c.iter().flatten().any(|&b| b);
+         if (cbf_luma || cbf_chroma) && self.pps.cu_qp_delta_enabled && !self.is_cu_qp_delta_coded {
+             // cu_qp_delta_abs: prefix TU(5) with ctx 0,1,1,1,1, suffix EG0
+             let mut v = 0;
+@@ -971,15 +991,22 @@
+         if !chroma_here {
+             return Ok(());
+         }
+-        let (xc, yc, log2c) = if log2 > 2 { (x0 / 2, y0 / 2, log2 - 1) } else { (xb / 2, yb / 2, 2) };
++        // Each component has one square chroma block (4:2:0) or two stacked ones (4:2:2); the
++        // upper block is reconstructed before the lower one is predicted from it.
++        let (csx, csy) = (self.pic.csx, self.pic.csy);
++        let (xc, yc, log2c) = if log2 > 2 { (x0 >> csx, y0 >> csy, log2 - 1) } else { (xb >> csx, yb >> csy, 2) };
++        let blocks = if self.pic.chroma_type == 2 { 2 } else { 1 };
+         for c in 1..3 {
+-            if self.cu_intra {
+-                let mode = self.intra_chroma_mode;
+-                self.intra_predict(xc, yc, log2c, c, mode);
+-            }
+-            if cbf_c[c - 1] {
+-                let qp = if c == 1 { self.qp_cb } else { self.qp_cr };
+-                self.residual(xc, yc, log2c, c, qp)?;
++            let qp = if c == 1 { self.qp_cb } else { self.qp_cr };
++            for t in 0..blocks {
++                let yt = yc + ((t as i32) << log2c);
++                if self.cu_intra {
++                    let mode = self.intra_chroma_mode;
++                    self.intra_predict(xc, yt, log2c, c, mode);
++                }
++                if cbf_c[c - 1][t] {
++                    self.residual(xc, yt, log2c, c, qp)?;
++                }
+             }
+         }
+         Ok(())
+@@ -988,9 +1015,10 @@
+     /// Intra prediction of an n x n block of component `c` at component position (x0, y0).
+     fn intra_predict(&mut self, x0: i32, y0: i32, log2: u32, c: usize, mode: u32) {
+         let n = 1usize << log2;
+-        let sc = if c == 0 { 1 } else { 2 };
+-        let (xl, yl) = (x0 * sc, y0 * sc);
+-        let unit = 4 / sc as usize; // component samples per 4x4 luma block
++        let (sx, sy) = if c == 0 { (1, 1) } else { (1i32 << self.pic.csx, 1i32 << self.pic.csy) };
++        let (xl, yl) = (x0 * sx, y0 * sy);
++        // component samples per 4x4 luma block, horizontally and vertically
++        let (ux, uy) = (4 / sx as usize, 4 / sy as usize);
+         let stride = if c == 0 { self.pic.width } else { self.pic.cwidth };
+         let constrained = self.pps.constrained_intra_pred;
+         let mut al = [false; 129];
+@@ -1011,21 +1039,25 @@
+         let mut k = 0;
+         while k < 2 * n {
+             let yn = y0 + k as i32;
+-            if avail(self.pic, xl - 1, yn * sc) {
+-                for i in 0..unit {
++            if avail(self.pic, xl - 1, yn * sy) {
++                for i in 0..uy {
+                     al[1 + k + i] = true;
+                     r.left[1 + k + i] = plane[(yn as usize + i) * stride + (x0 - 1) as usize].to_u16();
+                 }
+             }
++            k += uy;
++        }
++        let mut k = 0;
++        while k < 2 * n {
+             let xn = x0 + k as i32;
+-            if avail(self.pic, xn * sc, yl - 1) {
++            if avail(self.pic, xn * sx, yl - 1) {
+                 let o = (y0 - 1) as usize * stride + xn as usize;
+-                for i in 0..unit {
++                for i in 0..ux {
+                     at[1 + k + i] = true;
+                     r.top[1 + k + i] = plane[o + i].to_u16();
+                 }
+             }
+-            k += unit;
++            k += ux;
+         }
+         let bd = if c == 0 { self.pic.bd_y } else { self.pic.bd_c };
+         intra::substitute(r, &al, &at, n, bd);
+@@ -1447,8 +1479,9 @@
+         };
+         let bi = f.pred(0) && f.pred(1);
+         let pwt = self.sh.pwt.as_ref().filter(|_| weighted);
++        let (csx, csy) = (self.pic.csx, self.pic.csy);
+         for c in 0..3 {
+-            let (x, y, bw, bh, bd) = if c == 0 { (xp, yp, w, h, self.pic.bd_y) } else { (xp / 2, yp / 2, w / 2, h / 2, self.pic.bd_c) };
++            let (x, y, bw, bh, bd) = if c == 0 { (xp, yp, w, h, self.pic.bd_y) } else { (xp >> csx, yp >> csy, w >> csx, h >> csy, self.pic.bd_c) };
+             // Explicit weights equal to the default ones (weight 2^denom and offset 0 for every
+             // list used, as signalled for most slices of a weighted-prediction stream) give exactly
+             // the default prediction: with log2WD = denom + shift1 the weighted sums of 8-265 /
+@@ -1458,14 +1491,14 @@
+             // ((s << shift3) + off) >> shift3 (8-228, 8-262) is the reference sample itself.
+             if !bi && pwt.is_none() {
+                 let l = if f.pred(0) { 0 } else { 1 };
+-                let frac = if c == 0 { 3 } else { 7 };
+                 let mv = f.mv[l];
+-                if f.pred(l) && mv[0] & frac == 0 && mv[1] & frac == 0 {
+-                    let sh = if c == 0 { 2 } else { 3 };
++                // chroma vectors are in 1/8 sample units of the chroma plane (8.5.3.2.10: mvLX * 2 / SubWidthC)
++                let (mvx, mvy, frac, sh) = if c == 0 { (mv[0] as i32, mv[1] as i32, 3, 2) } else { (mv[0] as i32 * (2 >> csx), mv[1] as i32 * (2 >> csy), 7, 3) };
++                if f.pred(l) && mvx & frac == 0 && mvy & frac == 0 {
+                     let stride = if c == 0 { self.pic.width } else { self.pic.cwidth };
+                     let frame = &self.refs[l][f.ref_idx[l] as usize].frame;
+                     let dst = &mut self.pic.planes[c][y as usize * stride + x as usize..];
+-                    frame.copy_block(c, x + (mv[0] as i32 >> sh), y + (mv[1] as i32 >> sh), bw, bh, dst, stride);
++                    frame.copy_block(c, x + (mvx >> sh), y + (mvy >> sh), bw, bh, dst, stride);
+                     continue;
+                 }
+             }
+@@ -1480,7 +1513,9 @@
+                 if c == 0 {
+                     inter::mc_luma::<S>(frame, x, y, f.mv[l], bw, bh, buf, &mut self.mc);
+                 } else {
+-                    inter::mc_chroma::<S>(frame, c - 1, x, y, f.mv[l], bw, bh, buf, &mut self.mc);
++                    let mv = f.mv[l];
++                    let mvc = [mv[0] as i32 * (2 >> csx), mv[1] as i32 * (2 >> csy)];
++                    inter::mc_chroma::<S>(frame, c - 1, x, y, mvc, bw, bh, buf, &mut self.mc);
+                 }
+             }
+             let stride = if c == 0 { self.pic.width } else { self.pic.cwidth };
+diff -ruN orig/filmcraft-main/crates/hevc/src/tables.rs filmcraft-main/crates/hevc/src/tables.rs
+--- orig/filmcraft-main/crates/hevc/src/tables.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/src/tables.rs	2026-10-25 23:56:34.317966477 +0000
+@@ -68,6 +68,16 @@
+     }
+ }
+ 
++/// QpC of a chroma QP index (8.6.1): Table 8-10 for ChromaArrayType 1, `Min(qPi, 51)` otherwise.
++pub fn qpc(chroma_array_type: u32, qpi: i32) -> i32 {
++    if chroma_array_type == 1 { qpc_420(qpi) } else { qpi.min(51) }
++}
++
++/// Table 8-3: intra prediction mode of a 4:2:2 chroma block from the mode (0..=34) derived with
++/// Table 8-2 (the 4:2:2 chroma plane is half as wide as it is tall, so the angles are remapped).
++pub static INTRA_MODE_422: [u8; 35] =
++    [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
++
+ /// Table 9-50 ctxIdxMap for 4x4 sig_coeff_flag contexts.
+ pub static CTX_IDX_MAP: [u8; 16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8];
+ 
+@@ -120,4 +130,23 @@
+         assert_eq!(qpc_420(43), 37);
+         assert_eq!(qpc_420(51), 45);
+     }
++
++    /// ChromaArrayType 2 and 3 use Min(qPi, 51) instead of Table 8-10 (8.6.1).
++    #[test]
++    fn qpc_for_422_is_a_plain_clamp() {
++        for qpi in [-12, 0, 29, 30, 43, 44, 51, 52, 57] {
++            assert_eq!(qpc(2, qpi), qpi.min(51), "qPi {qpi}");
++            assert_eq!(qpc(1, qpi), qpc_420(qpi), "qPi {qpi}");
++        }
++    }
++
++    /// Table 8-3: every derived mode (0..=34) maps to a valid mode, planar / DC / the pure
++    /// horizontal and vertical directions follow the table, and the angular modes stay ordered.
++    #[test]
++    fn intra_mode_422_table() {
++        assert_eq!(INTRA_MODE_422.len(), 35);
++        assert!(INTRA_MODE_422.iter().all(|&m| m <= 34));
++        assert_eq!((INTRA_MODE_422[0], INTRA_MODE_422[1], INTRA_MODE_422[10], INTRA_MODE_422[26]), (0, 1, 10, 26));
++        assert!(INTRA_MODE_422.windows(2).all(|w| w[0] <= w[1]));
++    }
+ }
+diff -ruN orig/filmcraft-main/crates/hevc/tests/it/main.rs filmcraft-main/crates/hevc/tests/it/main.rs
+--- orig/filmcraft-main/crates/hevc/tests/it/main.rs	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/hevc/tests/it/main.rs	2026-10-25 23:56:34.339208613 +0000
+@@ -2,3 +2,4 @@
+ mod conformance;
+ mod perf;
+ mod robustness;
++mod yuv422;
+diff -ruN orig/filmcraft-main/crates/hevc/tests/it/yuv422.rs filmcraft-main/crates/hevc/tests/it/yuv422.rs
+--- orig/filmcraft-main/crates/hevc/tests/it/yuv422.rs	1970-01-01 00:00:00.000000000 +0000
++++ filmcraft-main/crates/hevc/tests/it/yuv422.rs	2026-10-25 23:56:45.778861738 +0000
+@@ -0,0 +1,173 @@
++//! HEVC Main 4:2:2 10 (RExt without range-extension tools): bit-exactness against ffmpeg's decode
++//! of libx265 streams (skipped when ffmpeg or libx265 is absent). Camera originals (Sony XAVC HS,
++//! Panasonic, Canon, Fujifilm) are this profile.
++
++use crate::common;
++use filmcraft_hevc::{Picture, Plane};
++use std::path::PathBuf;
++use std::process::Command;
++
++struct Fixture422 {
++    name: &'static str,
++    source: &'static str,
++    width: usize,
++    height: usize,
++    frames: u32,
++    filter: &'static str,
++    x265: &'static str,
++}
++
++const NOISE: &str = "noise=alls=12:allf=t+u";
++
++const FIXTURES: &[Fixture422] = &[
++    Fixture422 { name: "intra_422_10", source: "testsrc2", width: 352, height: 288, frames: 3, filter: NOISE, x265: "keyint=1:log-level=error" },
++    Fixture422 { name: "intra_422_10_nosao_nodbk", source: "testsrc2", width: 352, height: 288, frames: 2, filter: NOISE, x265: "keyint=1:no-sao=1:no-deblock=1:log-level=error" },
++    Fixture422 { name: "medium_422_10", source: "testsrc2", width: 352, height: 288, frames: 20, filter: NOISE, x265: "log-level=error" },
++    Fixture422 { name: "bframes_422_10", source: "testsrc2", width: 352, height: 288, frames: 30, filter: NOISE, x265: "bframes=8:b-pyramid=1:ref=4:rect=1:amp=1:log-level=error" },
++    Fixture422 { name: "tu4_422_10", source: "mandelbrot", width: 352, height: 288, frames: 8, filter: NOISE, x265: "ctu=32:tu-intra-depth=4:tu-inter-depth=4:max-tu-size=16:log-level=error" },
++    Fixture422 { name: "deblock_422_10", source: "testsrc2", width: 352, height: 288, frames: 12, filter: NOISE, x265: "deblock=-3,3:log-level=error" },
++    Fixture422 { name: "weightp_422_10", source: "testsrc2", width: 352, height: 288, frames: 20, filter: "fade=in:0:18", x265: "weightp=1:weightb=1:log-level=error" },
++    Fixture422 { name: "cu_lossless_422_10", source: "testsrc2", width: 176, height: 144, frames: 6, filter: NOISE, x265: "cu-lossless=1:log-level=error" },
++    Fixture422 { name: "qp1_422_10", source: "mandelbrot", width: 176, height: 144, frames: 4, filter: NOISE, x265: "qp=1:log-level=error" },
++    Fixture422 { name: "odd_1918x1078_422_10", source: "testsrc2", width: 1918, height: 1078, frames: 3, filter: NOISE, x265: "log-level=error" },
++    Fixture422 { name: "hd_1080p_422_10", source: "testsrc2", width: 1920, height: 1080, frames: 3, filter: "", x265: "log-level=error" },
++];
++
++fn dir() -> PathBuf {
++    filmcraft_testkit::fixtures_dir("hevc")
++}
++
++fn run(cmd: &mut Command) -> bool {
++    matches!(cmd.output(), Ok(o) if o.status.success())
++}
++
++/// Generate (if needed) the stream and ffmpeg's yuv422p10le decode of it.
++fn ensure(f: &Fixture422) -> Option<(PathBuf, PathBuf)> {
++    let ff = filmcraft_testkit::ffmpeg_or_skip(f.name)?;
++    let (hevc, yuv) = (dir().join(format!("{}.hevc", f.name)), dir().join(format!("{}.yuv", f.name)));
++    if !hevc.exists() {
++        let tmp = filmcraft_testkit::temp_path(&hevc);
++        let mut vf = format!("{}=size={}x{}:rate=25,format=yuv422p10le", f.source, f.width, f.height);
++        if !f.filter.is_empty() {
++            vf.push(',');
++            vf.push_str(f.filter);
++        }
++        let mut c = Command::new(&ff);
++        c.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", &vf, "-frames:v", &f.frames.to_string()]);
++        c.args(["-c:v", "libx265", "-pix_fmt", "yuv422p10le", "-profile:v", "main422-10", "-x265-params", f.x265, "-f", "hevc"]).arg(&tmp);
++        if !run(&mut c) {
++            let _ = std::fs::remove_file(&tmp);
++            eprintln!("SKIPPED ({}): libx265 4:2:2 encoder unavailable", f.name);
++            return None;
++        }
++        std::fs::rename(&tmp, &hevc).ok()?;
++    }
++    if !yuv.exists() {
++        let tmp = filmcraft_testkit::temp_path(&yuv);
++        let mut c = Command::new(&ff);
++        c.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(&hevc);
++        c.args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv422p10le"]).arg(&tmp);
++        assert!(run(&mut c), "reference decode failed for {}", f.name);
++        std::fs::rename(&tmp, &yuv).ok()?;
++    }
++    Some((hevc, yuv))
++}
++
++/// Compare pictures with a raw yuv422p10le reference: planes are w x h, w/2 x h and w/2 x h.
++fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result<(), String> {
++    let (cw, ch) = (w.div_ceil(2), h);
++    let fsize = (w * h + 2 * cw * ch) * 2;
++    let nref = reference.len() / fsize;
++    if pics.len() != nref {
++        return Err(format!("decoder produced {} frames, reference has {nref}", pics.len()));
++    }
++    for (i, p) in pics.iter().enumerate() {
++        if (p.width as usize, p.height as usize) != (w, h) {
++            return Err(format!("frame {i}: size {}x{} != {w}x{h}", p.width, p.height));
++        }
++        if p.chroma_format_idc != 2 || (p.chroma_width as usize, p.chroma_height as usize) != (cw, ch) {
++            return Err(format!("frame {i}: chroma {}x{} (idc {}) != {cw}x{ch} (idc 2)", p.chroma_width, p.chroma_height, p.chroma_format_idc));
++        }
++        let f = &reference[i * fsize..(i + 1) * fsize];
++        let (ys, cs) = (w * h * 2, cw * ch * 2);
++        let planes: [(&str, &Plane, &[u8], usize, usize); 3] = [("Y", &p.y, &f[..ys], w, h), ("U", &p.u, &f[ys..ys + cs], cw, ch), ("V", &p.v, &f[ys + cs..], cw, ch)];
++        for (name, got, exp, pw, ph) in planes {
++            for y in 0..ph {
++                for x in 0..pw {
++                    let k = y * pw + x;
++                    let want = u16::from_le_bytes([exp[2 * k], exp[2 * k + 1]]);
++                    if got.get(k) != want {
++                        return Err(format!("frame {i} (poc {}) plane {name}: first mismatch at ({x},{y}): got {} want {want}", p.poc, got.get(k)));
++                    }
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++fn check(name: &str) {
++    let f = FIXTURES.iter().find(|f| f.name == name).expect("fixture");
++    let Some((hevc, yuv)) = ensure(f) else { return };
++    let reference = std::fs::read(&yuv).expect("reference yuv");
++    for threads in [1, 3, 0] {
++        let pics = match common::decode_file_threads(&hevc, threads) {
++            Ok(p) => p,
++            Err((au, e, _)) => panic!("{name} (threads {threads}): decode error at access unit {au}: {e}"),
++        };
++        compare(&pics, &reference, f.width, f.height).unwrap_or_else(|e| panic!("{name} (threads {threads}): {e}"));
++        common::check_pts(&pics).unwrap_or_else(|e| panic!("{name} (threads {threads}): {e}"));
++    }
++}
++
++macro_rules! tests_422 {
++    ($($name:ident),* $(,)?) => { $( #[test] fn $name() { check(stringify!($name)); } )* };
++}
++
++tests_422!(
++    intra_422_10,
++    intra_422_10_nosao_nodbk,
++    medium_422_10,
++    bframes_422_10,
++    tu4_422_10,
++    deblock_422_10,
++    weightp_422_10,
++    cu_lossless_422_10,
++    qp1_422_10,
++    odd_1918x1078_422_10,
++    hd_1080p_422_10,
++);
++
++/// Damaged 4:2:2 streams (bit flips, truncation) never panic.
++#[test]
++fn hostile_422_streams_never_panic() {
++    let Some((hevc, _)) = ensure(&FIXTURES[0]) else { return };
++    let data = std::fs::read(hevc).expect("stream");
++    let aus = common::split_access_units(&data);
++    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
++    let mut next = || {
++        seed ^= seed << 13;
++        seed ^= seed >> 7;
++        seed ^= seed << 17;
++        seed
++    };
++    for round in 0..64 {
++        let mut dec = filmcraft_hevc::Decoder::new();
++        for (i, au) in aus.iter().enumerate() {
++            let mut bytes = au.to_vec();
++            if !bytes.is_empty() && (round + i) % 2 == 0 {
++                for _ in 0..4 {
++                    let at = (next() as usize) % bytes.len();
++                    bytes[at] ^= 1 << (next() % 8);
++                }
++                if round % 3 == 0 {
++                    bytes.truncate((next() as usize) % bytes.len() + 1);
++                }
++            }
++            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let _ = dec.decode(&bytes, i as i64);
++            }));
++            assert!(r.is_ok(), "panic decoding a damaged 4:2:2 stream (round {round}, access unit {i})");
++        }
++    }
++}
+diff -ruN orig/filmcraft-main/crates/platform/README.md filmcraft-main/crates/platform/README.md
+--- orig/filmcraft-main/crates/platform/README.md	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/crates/platform/README.md	2026-10-26 04:41:45.240140751 +0000
+@@ -129,7 +129,7 @@
+   pictures decode) through the software decoder, drops pictures already returned, keeps the ones
+   the hardware had decoded but not returned, and stays in software for that instance. The replay
+   log is bounded (600 samples / 256 MB); beyond it one error is returned and the next seek restarts
+-  in software. Streams our decoders cannot decode (HEVC 4:2:2) have no fallback: the error stands.
++  in software. Streams our decoders cannot decode (HEVC 4:4:4 / RExt tools, H.264 High 10 / 4:2:2) have no fallback: the error stands.
+ 
+ ## Hardware H.264 encoding (macOS)
+ 
+diff -ruN orig/filmcraft-main/docs/gaps.md filmcraft-main/docs/gaps.md
+--- orig/filmcraft-main/docs/gaps.md	2026-10-25 21:55:43.000000000 +0000
++++ filmcraft-main/docs/gaps.md	2026-10-26 04:41:45.342366098 +0000
+@@ -65,6 +65,7 @@
+ 
+ ## G3. 10-bit and 4:2:2 camera media needs hardware
+ 
++- **Update:** HEVC Main 4:2:2 10 now decodes in software (`crates/hevc`, tests in `tests/it/yuv422.rs`); written without a compiler, so run `cargo xtask ci` before trusting it. H.264 High 10 / 4:2:2 below is still open.
+ - **Missing:** our H.264 decoder is 8-bit 4:2:0 only (`crates/h264/README.md`: no High 10, High
+   4:2:2, 4:4:4, lossless, interlaced field / MBAFF); HEVC has no 4:2:2 / RExt. Most mirrorless and
+   cinema cameras record exactly these (Sony XAVC S-I / XAVC HS 4:2:2 10-bit, Panasonic, Canon
